@@ -4,7 +4,9 @@ Service Area Checker - drive time / miles from a base location to many ZIP codes
 - Origin: any address or ZIP (default: the office address).
 - Add many ZIP codes at once; each is drawn on the map and colored:
     green = within the max drive time, red = outside it.
-- Click a ZIP on the map to see drive time + miles, and remove it from the selection.
+- Every other ZIP area around the origin is shown in gray and is clickable:
+  click it to see its ZIP, drive time and miles, then add it to your selection.
+- Click a selected ZIP to see its details or remove it.
 
 Data sources (all free, no API keys):
 - Map tiles: OpenStreetMap
@@ -28,6 +30,8 @@ DEFAULT_ORIGIN = "6815 Manhattan Blvd, Fort Worth, TX 76120"
 DEFAULT_MAX_MINUTES = 30
 GREEN = "#2e9e4f"
 RED = "#d93025"
+GRAY = "#8a8f98"
+CLICKABLE_RADIUS_KM = 90  # gray clickable ZIP areas are shown within this distance of the origin
 HEADERS = {"User-Agent": "service-area-checker/1.0 (internal roofing tool)"}
 TX_ZIP_GEOJSON = (
     "https://raw.githubusercontent.com/OpenDataDE/State-zip-code-GeoJSON/"
@@ -47,9 +51,18 @@ def get_nomi():
     return pgeocode.Nominatim("us")
 
 
+def _iter_points(coords):
+    """Yield (lon, lat) from any nested GeoJSON coordinate list."""
+    if coords and isinstance(coords[0], (int, float)):
+        yield coords[0], coords[1]
+    else:
+        for c in coords:
+            yield from _iter_points(c)
+
+
 @st.cache_resource(show_spinner="Loading ZIP boundaries (first time only)...")
 def load_zip_polygons():
-    """Return {zip: geometry} for Texas ZIPs. Empty dict if the download fails."""
+    """Return {zip: {"geom", "lat", "lon"}} for Texas ZIPs. Empty dict if the download fails."""
     try:
         r = requests.get(TX_ZIP_GEOJSON, headers=HEADERS, timeout=90)
         r.raise_for_status()
@@ -60,11 +73,30 @@ def load_zip_polygons():
                 (str(v) for v in props.values() if re.fullmatch(r"\d{5}", str(v))),
                 None,
             )
-            if z and feat.get("geometry"):
-                out[z] = feat["geometry"]
+            geom = feat.get("geometry")
+            if not (z and geom):
+                continue
+            pts = list(_iter_points(geom.get("coordinates", [])))
+            if not pts:
+                continue
+            lons = [p[0] for p in pts]
+            lats = [p[1] for p in pts]
+            out[z] = {
+                "geom": geom,
+                "lat": (min(lats) + max(lats)) / 2,
+                "lon": (min(lons) + max(lons)) / 2,
+            }
         return out
     except Exception:
         return {}
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(a))
 
 
 def lookup_zip(z):
@@ -155,8 +187,27 @@ def circle_geometry(lat, lon, radius_km=1.6, n=28):
 ss = st.session_state
 ss.setdefault("origin", None)
 ss.setdefault("zips", {})  # zip -> {lat, lon, place, minutes, miles}
+ss.setdefault("preview", {})  # zip -> same fields, for clicked-but-not-added ZIPs
 ss.setdefault("selected", None)
+ss.setdefault("last_clicked", None)
 ss.setdefault("origin_text", DEFAULT_ORIGIN)
+
+
+def calc_zip(z):
+    """Return {lat, lon, place, minutes, miles} for one ZIP, or None (shows a message on failure)."""
+    info = lookup_zip(z)
+    if not info:
+        st.warning(f"Could not find ZIP {z}.")
+        return None
+    try:
+        (mins, miles), = route_many(ss.origin, [info])
+    except Exception as e:
+        st.error(f"Routing service failed: {e}. Try again in a moment.")
+        return None
+    if mins is None:
+        st.warning(f"No driving route found for {z}.")
+        return None
+    return {**info, "minutes": mins, "miles": miles}
 
 
 def add_zips(zip_list):
@@ -182,6 +233,7 @@ def add_zips(zip_list):
 def recompute_all():
     existing = list(ss.zips.keys())
     ss.zips = {}
+    ss.preview = {}
     ss.selected = None
     if existing:
         add_zips(existing)
@@ -240,45 +292,87 @@ with st.sidebar:
 st.title("📍 Service Area Checker")
 if not ss.origin:
     st.stop()
-st.caption(f"Origin: **{ss.origin['label']}** · limit: **{max_minutes} min**")
-
-if not ss.zips:
-    st.info("Add one or more ZIP codes from the sidebar.")
-    st.map(pd.DataFrame([{"lat": ss.origin["lat"], "lon": ss.origin["lon"]}]), zoom=9)
-    st.stop()
+st.caption(
+    f"Origin: **{ss.origin['label']}** · limit: **{max_minutes} min** · "
+    "click any area on the map to check it"
+)
 
 polygons = load_zip_polygons()
 
+# Handle a map click from the previous run (before drawing, so the panel is current)
+if "map_click" in ss and ss.map_click:
+    clicked = (ss.map_click.get("properties") or {}).get("zip")
+    if clicked and clicked != ss.last_clicked:
+        ss.last_clicked = clicked
+        ss.selected = clicked
+        if clicked not in ss.zips and clicked not in ss.preview:
+            with st.spinner(f"Calculating {clicked}..."):
+                data = calc_zip(clicked)
+            if data:
+                ss.preview[clicked] = data
+
 features = []
+
+# Gray, clickable base layer: every ZIP area near the origin that is not yet selected
+for z, p in polygons.items():
+    if z in ss.zips:
+        continue
+    if haversine_km(ss.origin["lat"], ss.origin["lon"], p["lat"], p["lon"]) > CLICKABLE_RADIUS_KM:
+        continue
+    pv = ss.preview.get(z)
+    if pv:
+        label = f"{z} · {pv['minutes']:.0f} min · {pv['miles']:.1f} mi (not added)"
+    else:
+        label = f"{z} · click for drive time"
+    features.append(
+        {
+            "type": "Feature",
+            "geometry": p["geom"],
+            "properties": {"zip": z, "kind": "base", "selected": z == ss.selected, "label": label},
+        }
+    )
+
+# Selected ZIPs, colored by drive time
 for z, d in ss.zips.items():
     within = d["minutes"] <= max_minutes
-    geom = polygons.get(z) or circle_geometry(d["lat"], d["lon"])
+    poly = polygons.get(z)
+    geom = poly["geom"] if poly else circle_geometry(d["lat"], d["lon"])
     features.append(
         {
             "type": "Feature",
             "geometry": geom,
             "properties": {
                 "zip": z,
-                "color": GREEN if within else RED,
+                "kind": "in" if within else "out",
                 "selected": z == ss.selected,
                 "label": f"{z} · {d['minutes']:.0f} min · {d['miles']:.1f} mi",
             },
         }
     )
 
+COLORS = {"in": GREEN, "out": RED, "base": GRAY}
+
+
+def style_fn(f):
+    p = f["properties"]
+    color = COLORS[p["kind"]]
+    return {
+        "color": "#111" if p["selected"] else color,
+        "weight": 4 if p["selected"] else (1.5 if p["kind"] != "base" else 0.8),
+        "fillColor": color,
+        "fillOpacity": 0.5 if p["kind"] != "base" else 0.12,
+    }
+
+
 lats = [d["lat"] for d in ss.zips.values()] + [ss.origin["lat"]]
 lons = [d["lon"] for d in ss.zips.values()] + [ss.origin["lon"]]
 
 m = folium.Map(location=[ss.origin["lat"], ss.origin["lon"]], zoom_start=10, tiles="OpenStreetMap")
-m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(30, 30))
+if len(lats) > 1:
+    m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(30, 30))
 folium.GeoJson(
     {"type": "FeatureCollection", "features": features},
-    style_function=lambda f: {
-        "color": "#111" if f["properties"]["selected"] else f["properties"]["color"],
-        "weight": 4 if f["properties"]["selected"] else 1.5,
-        "fillColor": f["properties"]["color"],
-        "fillOpacity": 0.5,
-    },
+    style_function=style_fn,
     tooltip=folium.GeoJsonTooltip(fields=["label"], labels=False),
 ).add_to(m)
 folium.Marker(
@@ -297,21 +391,25 @@ with left:
         key="map",
     )
     st.markdown(
-        f"<span style='color:{GREEN}'>■</span> within {max_minutes} min &nbsp;&nbsp; "
-        f"<span style='color:{RED}'>■</span> over {max_minutes} min",
+        f"<span style='color:{GREEN}'>■</span> selected, within {max_minutes} min &nbsp;&nbsp; "
+        f"<span style='color:{RED}'>■</span> selected, over {max_minutes} min &nbsp;&nbsp; "
+        f"<span style='color:{GRAY}'>■</span> not selected (click to check)",
         unsafe_allow_html=True,
     )
 
-clicked = ((out or {}).get("last_active_drawing") or {}).get("properties", {}).get("zip")
-if clicked and clicked in ss.zips and clicked != ss.selected:
-    ss.selected = clicked
+# Detect a new click; if there is one, store it and rerun so the panel updates
+click = (out or {}).get("last_active_drawing")
+new_zip = ((click or {}).get("properties") or {}).get("zip")
+if new_zip and new_zip != ss.last_clicked:
+    ss.map_click = click
     st.rerun()
 
 with right:
     st.subheader("Selected ZIP")
     sel = ss.selected
-    if sel and sel in ss.zips:
-        d = ss.zips[sel]
+    d = ss.zips.get(sel) or ss.preview.get(sel) if sel else None
+    if sel and d:
+        added = sel in ss.zips
         within = d["minutes"] <= max_minutes
         st.markdown(f"### {sel}")
         st.caption(d["place"])
@@ -322,44 +420,50 @@ with right:
             st.success(f"Within {max_minutes} min")
         else:
             st.error(f"Over {max_minutes} min")
-        if st.button("🗑 Remove this ZIP", use_container_width=True):
-            del ss.zips[sel]
-            ss.selected = None
-            st.rerun()
+        if added:
+            if st.button("🗑 Remove from selection", use_container_width=True):
+                del ss.zips[sel]
+                ss.selected = None
+                st.rerun()
+        else:
+            if st.button("➕ Add to selected ZIPs", use_container_width=True, type="primary"):
+                ss.zips[sel] = d
+                st.rerun()
     else:
-        st.write("Click a ZIP on the map to see its details.")
+        st.write("Click any area on the map to see its ZIP, drive time and miles.")
 
 # ----------------------------------------------------------------------------
 # Table + export
 # ----------------------------------------------------------------------------
-st.divider()
-rows = [
-    {
-        "ZIP": z,
-        "Area": d["place"],
-        "Drive time (min)": round(d["minutes"]),
-        "Miles": round(d["miles"], 1),
-        f"Within {max_minutes} min": d["minutes"] <= max_minutes,
-    }
-    for z, d in ss.zips.items()
-]
-df = pd.DataFrame(rows).sort_values("Drive time (min)").reset_index(drop=True)
-st.dataframe(df, use_container_width=True, hide_index=True)
+if ss.zips:
+    st.divider()
+    rows = [
+        {
+            "ZIP": z,
+            "Area": d["place"],
+            "Drive time (min)": round(d["minutes"]),
+            "Miles": round(d["miles"], 1),
+            f"Within {max_minutes} min": d["minutes"] <= max_minutes,
+        }
+        for z, d in ss.zips.items()
+    ]
+    df = pd.DataFrame(rows).sort_values("Drive time (min)").reset_index(drop=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-to_remove = st.multiselect("Remove several ZIPs", options=list(ss.zips.keys()))
-if to_remove and st.button("Remove selected"):
-    for z in to_remove:
-        ss.zips.pop(z, None)
-    if ss.selected in to_remove:
-        ss.selected = None
-    st.rerun()
+    to_remove = st.multiselect("Remove several ZIPs", options=list(ss.zips.keys()))
+    if to_remove and st.button("Remove selected"):
+        for z in to_remove:
+            ss.zips.pop(z, None)
+        if ss.selected in to_remove:
+            ss.selected = None
+        st.rerun()
 
-inside = df[df[f"Within {max_minutes} min"]]["ZIP"].tolist()
-st.markdown(f"**ZIPs within {max_minutes} min ({len(inside)}):**")
-st.code(", ".join(inside) if inside else "(none)", language=None)
-st.download_button(
-    "Download table (CSV)",
-    df.to_csv(index=False).encode("utf-8"),
-    file_name="zip_drive_times.csv",
-    mime="text/csv",
-)
+    inside = df[df[f"Within {max_minutes} min"]]["ZIP"].tolist()
+    st.markdown(f"**ZIPs within {max_minutes} min ({len(inside)}):**")
+    st.code(", ".join(inside) if inside else "(none)", language=None)
+    st.download_button(
+        "Download table (CSV)",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name="zip_drive_times.csv",
+        mime="text/csv",
+    )

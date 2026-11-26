@@ -7,6 +7,7 @@ Service Area Checker - drive time / miles from a base location to many ZIP codes
 - Click a ZIP on the map to see drive time + miles, and remove it from the selection.
 
 Data sources (all free, no API keys):
+- Map tiles: OpenStreetMap
 - ZIP centroids: GeoNames via pgeocode
 - ZIP boundaries: OpenDataDE State-zip-code-GeoJSON (Texas) - falls back to a circle if missing
 - Origin geocoding: OpenStreetMap Nominatim
@@ -268,7 +269,7 @@ for z, d in ss.zips.items():
 lats = [d["lat"] for d in ss.zips.values()] + [ss.origin["lat"]]
 lons = [d["lon"] for d in ss.zips.values()] + [ss.origin["lon"]]
 
-m = folium.Map(location=[ss.origin["lat"], ss.origin["lon"]], zoom_start=10, tiles="cartodbpositron")
+m = folium.Map(location=[ss.origin["lat"], ss.origin["lon"]], zoom_start=10, tiles="OpenStreetMap")
 m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(30, 30))
 folium.GeoJson(
     {"type": "FeatureCollection", "features": features},

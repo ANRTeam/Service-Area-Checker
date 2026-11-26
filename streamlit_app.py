@@ -16,6 +16,7 @@ Data sources (all free, no API keys):
 - Driving time / distance: OSRM public demo server (no live traffic)
 """
 
+import copy
 import math
 import re
 
@@ -344,8 +345,10 @@ def build_base_map(olat, olon, radius_km):
     return bm
 
 
-base_map = build_base_map(
-    round(ss.origin["lat"], 5), round(ss.origin["lon"], 5), CLICKABLE_RADIUS_KM
+# st_folium adds the selected layer INTO the map object it receives, so give it a fresh copy each run
+# (the cached original stays clean; the copy keeps the same ids so the browser does not redraw it).
+base_map = copy.deepcopy(
+    build_base_map(round(ss.origin["lat"], 5), round(ss.origin["lon"], 5), CLICKABLE_RADIUS_KM)
 )
 
 # Dynamic layer: only the selected ZIPs. This is the only thing re-sent to the browser on add/remove.

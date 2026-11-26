@@ -31,7 +31,7 @@ DEFAULT_MAX_MINUTES = 30
 GREEN = "#2e9e4f"
 RED = "#d93025"
 GRAY = "#8a8f98"
-CLICKABLE_RADIUS_KM = 90  # gray clickable ZIP areas are shown within this distance of the origin
+CLICKABLE_RADIUS_KM = 60  # gray clickable ZIP areas are shown within this distance of the origin
 HEADERS = {"User-Agent": "service-area-checker/1.0 (internal roofing tool)"}
 TX_ZIP_GEOJSON = (
     "https://raw.githubusercontent.com/OpenDataDE/State-zip-code-GeoJSON/"
@@ -60,6 +60,25 @@ def _iter_points(coords):
             yield from _iter_points(c)
 
 
+def simplify_geom(geom, step=0.0006):
+    """Round to ~10 m and drop points closer than ~60 m to the last kept one (smaller, faster map)."""
+
+    def ring(r):
+        out = [r[0]]
+        for p in r[1:-1]:
+            if abs(p[0] - out[-1][0]) > step or abs(p[1] - out[-1][1]) > step:
+                out.append(p)
+        out.append(r[0])
+        return [[round(x, 4), round(y, 4)] for x, y in out] if len(out) >= 4 else r
+
+    t, c = geom.get("type"), geom.get("coordinates", [])
+    if t == "Polygon":
+        return {"type": t, "coordinates": [ring(r) for r in c]}
+    if t == "MultiPolygon":
+        return {"type": t, "coordinates": [[ring(r) for r in poly] for poly in c]}
+    return geom
+
+
 @st.cache_resource(show_spinner="Loading ZIP boundaries (first time only)...")
 def load_zip_polygons():
     """Return {zip: {"geom", "lat", "lon"}} for Texas ZIPs. Empty dict if the download fails."""
@@ -82,7 +101,7 @@ def load_zip_polygons():
             lons = [p[0] for p in pts]
             lats = [p[1] for p in pts]
             out[z] = {
-                "geom": geom,
+                "geom": simplify_geom(geom),
                 "lat": (min(lats) + max(lats)) / 2,
                 "lon": (min(lons) + max(lons)) / 2,
             }
@@ -299,92 +318,71 @@ st.caption(
 
 polygons = load_zip_polygons()
 
-# Handle a map click from the previous run (before drawing, so the panel is current)
-if "map_click" in ss and ss.map_click:
-    clicked = (ss.map_click.get("properties") or {}).get("zip")
-    if clicked and clicked != ss.last_clicked:
-        ss.last_clicked = clicked
-        ss.selected = clicked
-        if clicked not in ss.zips and clicked not in ss.preview:
-            with st.spinner(f"Calculating {clicked}..."):
-                data = calc_zip(clicked)
-            if data:
-                ss.preview[clicked] = data
 
-features = []
+@st.cache_resource(show_spinner="Drawing map (first time only)...")
+def build_base_map(olat, olon, radius_km):
+    """Static map: tiles + origin + clickable gray ZIP areas. Built once per origin, never redrawn."""
+    feats = []
+    for z, p in polygons.items():
+        if haversine_km(olat, olon, p["lat"], p["lon"]) <= radius_km:
+            feats.append(
+                {
+                    "type": "Feature",
+                    "geometry": p["geom"],
+                    "properties": {"zip": z, "label": f"{z} (click to check)"},
+                }
+            )
+    bm = folium.Map(location=[olat, olon], zoom_start=10, tiles="OpenStreetMap")
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": feats},
+        style_function=lambda f: {"color": GRAY, "weight": 0.8, "fillColor": GRAY, "fillOpacity": 0.12},
+        tooltip=folium.GeoJsonTooltip(fields=["label"], labels=False),
+    ).add_to(bm)
+    folium.Marker(
+        [olat, olon], tooltip="Origin", icon=folium.Icon(color="blue", icon="home")
+    ).add_to(bm)
+    return bm
 
-# Gray, clickable base layer: every ZIP area near the origin that is not yet selected
-for z, p in polygons.items():
-    if z in ss.zips:
-        continue
-    if haversine_km(ss.origin["lat"], ss.origin["lon"], p["lat"], p["lon"]) > CLICKABLE_RADIUS_KM:
-        continue
-    pv = ss.preview.get(z)
-    if pv:
-        label = f"{z} · {pv['minutes']:.0f} min · {pv['miles']:.1f} mi (not added)"
-    else:
-        label = f"{z} · click for drive time"
-    features.append(
-        {
-            "type": "Feature",
-            "geometry": p["geom"],
-            "properties": {"zip": z, "kind": "base", "selected": z == ss.selected, "label": label},
-        }
-    )
 
-# Selected ZIPs, colored by drive time
+base_map = build_base_map(
+    round(ss.origin["lat"], 5), round(ss.origin["lon"], 5), CLICKABLE_RADIUS_KM
+)
+
+# Dynamic layer: only the selected ZIPs. This is the only thing re-sent to the browser on add/remove.
+sel_features = []
 for z, d in ss.zips.items():
     within = d["minutes"] <= max_minutes
     poly = polygons.get(z)
     geom = poly["geom"] if poly else circle_geometry(d["lat"], d["lon"])
-    features.append(
+    sel_features.append(
         {
             "type": "Feature",
             "geometry": geom,
             "properties": {
                 "zip": z,
-                "kind": "in" if within else "out",
-                "selected": z == ss.selected,
+                "color": GREEN if within else RED,
                 "label": f"{z} · {d['minutes']:.0f} min · {d['miles']:.1f} mi",
             },
         }
     )
-
-COLORS = {"in": GREEN, "out": RED, "base": GRAY}
-
-
-def style_fn(f):
-    p = f["properties"]
-    color = COLORS[p["kind"]]
-    return {
-        "color": "#111" if p["selected"] else color,
-        "weight": 4 if p["selected"] else (1.5 if p["kind"] != "base" else 0.8),
-        "fillColor": color,
-        "fillOpacity": 0.5 if p["kind"] != "base" else 0.12,
-    }
-
-
-lats = [d["lat"] for d in ss.zips.values()] + [ss.origin["lat"]]
-lons = [d["lon"] for d in ss.zips.values()] + [ss.origin["lon"]]
-
-m = folium.Map(location=[ss.origin["lat"], ss.origin["lon"]], zoom_start=10, tiles="OpenStreetMap")
-if len(lats) > 1:
-    m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(30, 30))
-folium.GeoJson(
-    {"type": "FeatureCollection", "features": features},
-    style_function=style_fn,
-    tooltip=folium.GeoJsonTooltip(fields=["label"], labels=False),
-).add_to(m)
-folium.Marker(
-    [ss.origin["lat"], ss.origin["lon"]],
-    tooltip="Origin",
-    icon=folium.Icon(color="blue", icon="home"),
-).add_to(m)
+fg = folium.FeatureGroup(name="selected")
+if sel_features:
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": sel_features},
+        style_function=lambda f: {
+            "color": f["properties"]["color"],
+            "weight": 1.5,
+            "fillColor": f["properties"]["color"],
+            "fillOpacity": 0.5,
+        },
+        tooltip=folium.GeoJsonTooltip(fields=["label"], labels=False),
+    ).add_to(fg)
 
 left, right = st.columns([3, 1.3])
 with left:
     out = st_folium(
-        m,
+        base_map,
+        feature_group_to_add=fg,
         height=580,
         use_container_width=True,
         returned_objects=["last_active_drawing"],
@@ -397,17 +395,22 @@ with left:
         unsafe_allow_html=True,
     )
 
-# Detect a new click; if there is one, store it and rerun so the panel updates
+# Handle a click in this same run (no extra rerun)
 click = (out or {}).get("last_active_drawing")
 new_zip = ((click or {}).get("properties") or {}).get("zip")
 if new_zip and new_zip != ss.last_clicked:
-    ss.map_click = click
-    st.rerun()
+    ss.last_clicked = new_zip
+    ss.selected = new_zip
+    if new_zip not in ss.zips and new_zip not in ss.preview:
+        with st.spinner(f"Calculating {new_zip}..."):
+            data = calc_zip(new_zip)
+        if data:
+            ss.preview[new_zip] = data
 
 with right:
     st.subheader("Selected ZIP")
     sel = ss.selected
-    d = ss.zips.get(sel) or ss.preview.get(sel) if sel else None
+    d = (ss.zips.get(sel) or ss.preview.get(sel)) if sel else None
     if sel and d:
         added = sel in ss.zips
         within = d["minutes"] <= max_minutes
@@ -423,7 +426,6 @@ with right:
         if added:
             if st.button("🗑 Remove from selection", use_container_width=True):
                 del ss.zips[sel]
-                ss.selected = None
                 st.rerun()
         else:
             if st.button("➕ Add to selected ZIPs", use_container_width=True, type="primary"):
